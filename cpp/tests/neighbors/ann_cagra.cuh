@@ -1165,13 +1165,8 @@ inline std::vector<AnnCagraInputs> generate_inputs()
   inputs2 = raft::util::itertools::product<AnnCagraInputs>(
     {100},
     {1000},
-<<<<<<< HEAD:cpp/tests/neighbors/ann_cagra.cuh
     {1, 3, 5, 7, 8, 17, 64, 128, 137, 192, 256, 512, 1024},  // dim
     {16},                                                    // k
-=======
-    {1, 3, 5, 7, 8, 17, 64, 128, 137, 192, 256, 512, 619, 1024},  // dim
-    {16},                                                         // k
->>>>>>> 8525f291 (Add tests for iterative_build_graph_index):cpp/test/neighbors/ann_cagra.cuh
     {graph_build_algo::IVF_PQ,
      graph_build_algo::NN_DESCENT,
      graph_build_algo::ITERATIVE_CAGRA_SEARCH},
