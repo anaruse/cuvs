@@ -11,7 +11,8 @@ set -e
 PARALLEL_LEVEL=${PARALLEL_LEVEL:=`nproc`}
 
 BUILD_TYPE=Release
-BUILD_DIR=build/
+
+BUILD_DIR=build
 
 CUVS_REPO_REL=""
 EXTRA_CMAKE_ARGS=""
@@ -32,7 +33,9 @@ else
 fi
 
 if [ "$1" == "clean" ]; then
-  rm -rf build
+  # rm -rf build
+  rm -rf c/${BUILD_DIR}
+  rm -rf cpp/${BUILD_DIR}
   exit 0
 fi
 
@@ -50,7 +53,7 @@ fi
 build_example() {
   example_dir=${1}
   example_dir="${EXAMPLES_DIR}/${example_dir}"
-  build_dir="${example_dir}/build"
+  build_dir="${example_dir}/${BUILD_DIR}"
 
   # Configure
   cmake -S ${example_dir} -B ${build_dir} \
@@ -63,5 +66,5 @@ build_example() {
   cmake --build ${build_dir} -j${PARALLEL_LEVEL}
 }
 
-build_example c
+# build_example c
 build_example cpp
