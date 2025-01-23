@@ -25,7 +25,7 @@ static struct argp_option options[] = {
     {"dataset"          , 'd', "PATH", 0, "Path to dataset file" },
     {"index"            , 'i', "PATH", 0, "Path to index file" },
     {"dtype"            , 't', "TYPE", 0, "Data type name [float/half/int8/uint8]"},
-    {"index_method"     , 400, "STR" , 0, "Method to create knn graph [ivfpq/nnd]"},
+    {"index_method"     , 400, "STR" , 0, "Method to create knn graph [ivfpq/nnd/cagra]"},
     {"graph_degree"     , 'D', "INT" , 0, "Degree of output kNN graph"},
     {"guarantee_connectivity" , 'G', "INT" , 0, "Whether to guarantee graph connectivity [0/1]"},
     { 0 }
@@ -96,13 +96,30 @@ void build_index(
 
     auto dataset_view = raft::make_host_matrix_view<const DataT, int64_t>(
         (const DataT*) dataset_ptr, dataset_size, dataset_dim );
-    fprintf(stderr, "dataset_view: extent(0)=%ld, extent(1)=%ld\n",
+    fprintf(stderr, "# dataset_view: extent(0)=%ld, extent(1)=%ld\n",
             dataset_view.extent(0), dataset_view.extent(1));
 
     cuvs::neighbors::cagra::index_params index_params;
     index_params.graph_degree = graph_degree;
     index_params.intermediate_graph_degree = graph_degree * 2;
     index_params.guarantee_connectivity = guarantee_connectivity;
+
+    if (index_method == "cagra") {
+        fprintf(stderr, "# Initial kNN graph will be created by CAGRA\n");
+        index_params.graph_build_params = cuvs::neighbors::cagra::graph_build_params::iterative_search_params();
+    } else if (index_method == "nnd") {
+        fprintf(stderr, "# Initial kNN graph will be created by NND\n");
+        index_params.graph_build_params = cuvs::neighbors::cagra::graph_build_params::nn_descent_params(
+            index_params.intermediate_graph_degree,
+            index_params.metric
+            );
+    } else if (index_method == "ivfpq") {
+        fprintf(stderr, "# Initial kNN graph will be created by IVFPQ\n");
+        index_params.graph_build_params = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params(
+            raft::matrix_extent<int64_t>{dataset_size, dataset_dim},
+            index_params.metric
+            );
+    }
     
     auto index = cuvs::neighbors::cagra::build(res, index_params, dataset_view);
 
@@ -134,8 +151,8 @@ int main(int argc, char** argv)
     if (args.graph_degree <= 0 ) {
         error_message += "- Degree of output kNN graph must be larger than 0 (-D)\n";
     }
-    if (args.index_method != "ivfpq" && args.index_method != "nnd") {
-        error_message += "- Method to create knn graph must be either \"ivfpq\" or \"nnd\"\n";
+    if (args.index_method != "ivfpq" && args.index_method != "nnd" && args.index_method != "cagra") {
+        error_message += "- Method to create knn graph must be either \"ivfpq\", \"nnd\", or \"cagra\"\n";
     }
     if (error_message.length() != 0) {
         fprintf(stderr, "[ERROR]\n%s", error_message.c_str());
@@ -149,6 +166,9 @@ int main(int argc, char** argv)
         } else if (args.index_method == "nnd") {
             args.index_path = args.dataset_path
                 + ".nnd.k" + std::to_string(args.graph_degree);
+        } else if (args.index_method == "cagra") {
+            args.index_path = args.dataset_path
+                + ".cagra.k" + std::to_string(args.graph_degree);
         }
     }
 
