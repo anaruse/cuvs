@@ -28,6 +28,7 @@ static struct argp_option options[] = {
     {"index_method"     , 400, "STR" , 0, "Method to create knn graph [ivfpq/nnd/cagra]"},
     {"graph_degree"     , 'D', "INT" , 0, "Degree of output kNN graph"},
     {"guarantee_connectivity" , 'G', "INT" , 0, "Whether to guarantee graph connectivity [0/1]"},
+    {"remove_duplicates" , 'R', "INT" , 0, "Whether to remove duplicate nodes [0/1]"},
     { 0 }
 };
 
@@ -38,6 +39,7 @@ struct arguments {
     std::string index_method;
     std::uint32_t graph_degree;
     std::uint32_t guarantee_connectivity;
+    std::uint32_t remove_duplicates;
 };
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
@@ -62,6 +64,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     case 'G':
         arguments->guarantee_connectivity = std::stoi(arg);
         break;
+    case 'R':
+        arguments->remove_duplicates = std::stoi(arg);
+        break;
     case ARGP_KEY_ARG:
         break;
     case ARGP_KEY_END:
@@ -81,7 +86,8 @@ void build_index(
     std::string index_method,
     std::string index_path,
     std::size_t graph_degree,
-    bool guarantee_connectivity
+    bool guarantee_connectivity,
+    bool remove_duplicates
     )
 {
     raft::resources res;
@@ -103,6 +109,7 @@ void build_index(
     index_params.graph_degree = graph_degree;
     index_params.intermediate_graph_degree = graph_degree * 2;
     index_params.guarantee_connectivity = guarantee_connectivity;
+    index_params.deactivate_duplicate_nodes = remove_duplicates;
 
     if (index_method == "cagra") {
         fprintf(stderr, "# CAGRA graph will be created by CAGRA\n");
@@ -137,6 +144,7 @@ int main(int argc, char** argv)
         "ivfpq", /* index_method */
         0,       /* graph_degree */
         0,       /* guarantee_connectivity */
+        0,       /* remove_duplicates */
     };
 
     argp_parse(&argp, argc, argv, 0, 0, &args);
@@ -182,8 +190,12 @@ int main(int argc, char** argv)
     const std::string index_method = args.index_method;
     const uint32_t graph_degree = args.graph_degree;
     bool guarantee_connectivity = false;
+    bool remove_duplicates = false;
     if (args.guarantee_connectivity) {
         guarantee_connectivity = true;
+    }
+    if (args.remove_duplicates) {
+        remove_duplicates = true;
     }
 
     fprintf( stderr, "# dataset_path: %s\n", dataset_path.c_str() );
@@ -192,20 +204,21 @@ int main(int argc, char** argv)
     fprintf( stderr, "# index_path: %s\n", index_path.c_str() );
     fprintf( stderr, "# graph_degree: %u\n", graph_degree);
     fprintf( stderr, "# guarantee_connectivity: %s\n", (guarantee_connectivity ? "true" : "false"));
+    fprintf( stderr, "# remove_duplicates: %s\n", (remove_duplicates ? "true" : "false"));
 
     using IdxT = std::uint32_t;
     if (dtype_name == "float") {
         build_index<float, IdxT>(dataset_path, index_method, index_path, graph_degree,
-                                 guarantee_connectivity);
+                                 guarantee_connectivity, remove_duplicates);
     } else if (dtype_name == "half") {
         build_index<half, IdxT>(dataset_path, index_method, index_path, graph_degree,
-                                guarantee_connectivity);
+                                guarantee_connectivity, remove_duplicates);
     } else if (dtype_name == "int8") {
         build_index<std::int8_t, IdxT>(dataset_path, index_method, index_path, graph_degree,
-                                       guarantee_connectivity);
+                                       guarantee_connectivity, remove_duplicates);
     } else if (dtype_name == "uint8") {
         build_index<std::uint8_t, IdxT>(dataset_path, index_method, index_path, graph_degree,
-                                        guarantee_connectivity);
+                                        guarantee_connectivity, remove_duplicates);
     } else {
         std::fprintf(stderr, "Unknown data type %s\n", dtype_name.c_str());
         return -1;

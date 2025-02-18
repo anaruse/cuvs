@@ -155,13 +155,16 @@ __global__ void kern_prune(const IdxT* const knn_graph,  // [graph_chunk_size, g
   // count number of detours (A->D->B)
   for (uint32_t kAD = 0; kAD < graph_degree - 1; kAD++) {
     const uint64_t iD = knn_graph[kAD + (graph_degree * iA)];
+    if (iD == iA) { continue; }
     if (iD >= graph_size) { continue; }
     for (uint32_t kDB = threadIdx.x; kDB < graph_degree; kDB += blockDim.x) {
       const uint64_t iB_candidate = knn_graph[kDB + ((uint64_t)graph_degree * iD)];
+      if (iB_candidate == iA) { continue; }
       for (uint32_t kAB = kAD + 1; kAB < graph_degree; kAB++) {
         // if ( kDB < kAB )
         {
           const uint64_t iB = knn_graph[kAB + (graph_degree * iA)];
+          if (iB == iA) { continue; }
           if (iB == iB_candidate) {
             atomicAdd(smem_num_detour + kAB, 1);
             break;
@@ -672,7 +675,8 @@ void mst_optimization(raft::resources const& res,
                       raft::host_matrix_view<IdxT, int64_t, raft::row_major> input_graph,
                       raft::host_matrix_view<IdxT, int64_t, raft::row_major> output_graph,
                       raft::host_vector_view<uint32_t, int64_t> mst_graph_num_edges,
-                      bool use_gpu = true)
+                      const uint32_t* deactivated_nodes_bitset = nullptr,
+                      bool use_gpu                             = true)
 {
   if (use_gpu) {
     RAFT_LOG_DEBUG("# MST optimization on GPU");
@@ -706,6 +710,15 @@ void mst_optimization(raft::resources const& res,
   auto label_ptr              = label.data_handle();
   auto cluster_size_ptr       = cluster_size.data_handle();
   auto candidate_edges_ptr    = candidate_edges.data_handle();
+
+  //
+  IdxT num_deactivated_nodes = 0;
+  if (deactivated_nodes_bitset) {
+    num_deactivated_nodes =
+      cuvs::neighbors::cagra::detail::bitset_count(deactivated_nodes_bitset, graph_size);
+  }
+  RAFT_LOG_INFO(
+    "[%s, %d] num_deactivated_nodes: %lu", __FILE__, __LINE__, (uint64_t)num_deactivated_nodes);
 
   // Initialize arrays
 #pragma omp parallel for
@@ -812,6 +825,12 @@ void mst_optimization(raft::resources const& res,
       for (uint64_t i = 0; i < graph_size; i++) {
         candidate_edges_ptr[i] = graph_size;
         if (label_ptr[i] == main_cluster_label) continue;
+        if (deactivated_nodes_bitset) {
+          // If it's a deactivated node, nothing.
+          if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, i)) {
+            continue;
+          }
+        }
         uint64_t j = i;
         while (label_ptr[j] != main_cluster_label) {
           constexpr uint32_t ofst = 97;
@@ -1019,12 +1038,14 @@ void mst_optimization(raft::resources const& res,
         msg += ", altenate: " + std::to_string(num_alternate);
         if (num_failure > 0) { msg += ", failure: " + std::to_string(num_failure); }
       }
-      RAFT_LOG_DEBUG("%s", msg.c_str());
+      // RAFT_LOG_DEBUG("%s", msg.c_str());
+      RAFT_LOG_INFO("%s", msg.c_str());
     }
-    RAFT_EXPECTS(num_clusters > 0, "No clusters could not be created in MST optimization.");
+    RAFT_EXPECTS(num_clusters > num_deactivated_nodes,
+                 "No clusters could not be created in MST optimization.");
     RAFT_EXPECTS(total_outgoing_edges == total_incoming_edges,
                  "The numbers of incoming and outcoming edges are mismatch.");
-    if (num_clusters == 1) { break; }
+    if (num_clusters == num_deactivated_nodes + 1) { break; }
     num_clusters_pre = num_clusters;
   }
 
@@ -1063,6 +1084,29 @@ void mst_optimization(raft::resources const& res,
   RAFT_LOG_DEBUG("# MST optimization time: %.1lf sec", time_mst_opt_end - time_mst_opt_start);
 }
 
+template <typename IdxT = uint32_t>
+bool deactivate_node(IdxT* output_graph,
+                     uint64_t output_degree,
+                     const IdxT* input_graph,
+                     uint64_t input_degree,
+                     IdxT node_id)
+{
+  bool deactivated_node = true;
+  for (uint64_t k = 0; k < input_degree; k++) {
+    if (input_graph[k] != node_id) {
+      deactivated_node = false;
+      break;
+    }
+  }
+  if (deactivated_node) {
+    // RAFT_LOG_INFO("Node %lu is a deactivated node.", (uint64_t)node_id);
+    for (uint64_t k = 0; k < output_degree; k++) {
+      output_graph[k] = node_id;
+    }
+  }
+  return deactivated_node;
+}
+
 template <
   typename IdxT = uint32_t,
   typename g_accessor =
@@ -1071,7 +1115,8 @@ void optimize(
   raft::resources const& res,
   raft::mdspan<IdxT, raft::matrix_extent<int64_t>, raft::row_major, g_accessor> knn_graph,
   raft::host_matrix_view<IdxT, int64_t, raft::row_major> new_graph,
-  const bool guarantee_connectivity = true)
+  const bool guarantee_connectivity        = true,
+  const uint32_t* deactivated_nodes_bitset = nullptr)
 {
   RAFT_LOG_DEBUG(
     "# Pruning kNN graph (size=%lu, degree=%lu)\n", knn_graph.extent(0), knn_graph.extent(1));
@@ -1100,7 +1145,12 @@ void optimize(
       raft::make_host_matrix<IdxT, int64_t, raft::row_major>(graph_size, output_graph_degree);
     RAFT_LOG_INFO("MST optimization is used to guarantee graph connectivity.");
     constexpr bool use_gpu = true;
-    mst_optimization(res, knn_graph, mst_graph.view(), mst_graph_num_edges.view(), use_gpu);
+    mst_optimization(res,
+                     knn_graph,
+                     mst_graph.view(),
+                     mst_graph_num_edges.view(),
+                     deactivated_nodes_bitset,
+                     use_gpu);
 
     for (uint64_t i = 0; i < graph_size; i++) {
       if (i < 8 || i >= graph_size - 8) {
@@ -1200,6 +1250,15 @@ void optimize(
     bool invalid_neighbor_list = false;
 #pragma omp parallel for
     for (uint64_t i = 0; i < graph_size; i++) {
+      // If a node is deactivated, isolate it
+      if (deactivate_node<IdxT>(output_graph_ptr + (output_graph_degree * i),
+                                output_graph_degree,
+                                input_graph_ptr + (input_graph_degree * i),
+                                input_graph_degree,
+                                i)) {
+        continue;
+      }
+
       // Find the `output_graph_degree` smallest detourable count nodes by checking the detourable
       // count of the neighbors while increasing the target detourable count from zero.
       uint64_t pk         = 0;
@@ -1346,6 +1405,12 @@ void optimize(
       auto my_rev_graph = rev_graph.data_handle() + (output_graph_degree * i);
       auto my_out_graph = output_graph_ptr + (output_graph_degree * i);
 
+      // If a node is deactivated, isolate it
+      if (deactivate_node<IdxT>(
+            my_out_graph, output_graph_degree, my_rev_graph, output_graph_degree, i)) {
+        continue;
+      }
+
       // If guarantee_connectivity == true, use a temporal list to merge the neighbor lists of the
       // graphs.
       std::vector<IdxT> temp_output_neighbor_list;
@@ -1484,6 +1549,9 @@ void optimize(
       auto my_out_graph = output_graph_ptr + (output_graph_degree * i);
       for (uint32_t j = 0; j < output_graph_degree; j++) {
         const auto neighbor_a = my_out_graph[j];
+
+        // Check self edge
+        if (neighbor_a == i) { continue; }
 
         // Check oor
         if (neighbor_a > graph_size) {

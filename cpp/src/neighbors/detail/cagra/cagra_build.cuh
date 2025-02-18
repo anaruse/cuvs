@@ -379,7 +379,8 @@ void optimize(
   raft::resources const& res,
   raft::mdspan<IdxT, raft::matrix_extent<int64_t>, raft::row_major, g_accessor> knn_graph,
   raft::host_matrix_view<IdxT, int64_t, raft::row_major> new_graph,
-  const bool guarantee_connectivity = false)
+  const bool guarantee_connectivity        = false,
+  const uint32_t* deactivated_nodes_bitset = nullptr)
 {
   using internal_IdxT = typename std::make_unsigned<IdxT>::type;
 
@@ -398,7 +399,7 @@ void optimize(
       knn_graph.extent(1));
 
   cagra::detail::graph::optimize(
-    res, knn_graph_internal, new_graph_internal, guarantee_connectivity);
+    res, knn_graph_internal, new_graph_internal, guarantee_connectivity, deactivated_nodes_bitset);
 }
 
 template <typename T,
@@ -408,7 +409,8 @@ template <typename T,
 auto iterative_build_graph(
   raft::resources const& res,
   const index_params& params,
-  raft::mdspan<const T, raft::matrix_extent<int64_t>, raft::row_major, Accessor> dataset)
+  raft::mdspan<const T, raft::matrix_extent<int64_t>, raft::row_major, Accessor> dataset,
+  uint32_t* deactivated_nodes_bitset = nullptr)
 {
   size_t intermediate_degree = params.intermediate_graph_degree;
   size_t graph_degree        = params.graph_degree;
@@ -516,6 +518,7 @@ auto iterative_build_graph(
     auto dev_query_view = raft::make_device_matrix_view<const T, int64_t>(
       dev_dataset.data_handle(), (int64_t)curr_query_size, dev_dataset.extent(1));
     auto neighbors = raft::make_host_matrix<IdxT, int64_t>(curr_query_size, curr_topk);
+    auto distances = raft::make_host_matrix<float, int64_t>(curr_query_size, curr_topk);
 
     // Search.
     // Since there are many queries, divide them into batches and search them.
@@ -547,15 +550,56 @@ auto iterative_build_graph(
                  batch_dev_neighbors_view.data_handle(),
                  batch_neighbors_view.size(),
                  raft::resource::get_cuda_stream(res));
+      auto batch_distances_view = raft::make_host_matrix_view<float, int64_t>(
+        distances.data_handle() + batch.offset() * curr_topk, batch.size(), curr_topk);
+      raft::copy(batch_distances_view.data_handle(),
+                 batch_dev_distances_view.data_handle(),
+                 batch_distances_view.size(),
+                 raft::resource::get_cuda_stream(res));
     }
+
+    // Deactivate duplicate nodes
+    if (deactivated_nodes_bitset) {
+      RAFT_LOG_INFO("Disabling duplicate nodes");
+      for (IdxT i = 0; i < curr_query_size; i++) {
+        if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, i)) continue;
+        if (distances(i, 0) > 0) continue;
+        auto j = neighbors(i, 0);
+        if (i <= j) continue;
+
+        RAFT_LOG_INFO("# node %lu and %lu may be duplicated nodes.", (uint64_t)i, (uint64_t)j);
+        cuvs::neighbors::cagra::detail::bitset_set(deactivated_nodes_bitset, i, true);
+      }
+      for (IdxT i = 0; i < curr_query_size; i++) {
+        if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, i)) {
+          // If node-i is a duplicate node, all edges from it are directed back to itself.
+          for (uint64_t k = 0; k < curr_topk; k++) {
+            neighbors(i, k) = i;
+          }
+        } else {
+          for (uint64_t k = 0; k < curr_topk; k++) {
+            auto j = neighbors(i, k);
+            // If node-j is a duplicate node, an edge to it is directed back to node-i.
+            if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, j)) {
+              neighbors(i, k) = i;
+            }
+          }
+        }
+      }
+    }
+
+    RAFT_LOG_INFO("params.guarantee_connectivity = %d", (int)params.guarantee_connectivity);
 
     // Optimize graph
     bool flag_last  = (curr_graph_size == final_graph_size);
     curr_graph_size = curr_query_size;
     cagra_graph     = raft::make_host_matrix<IdxT, int64_t>(0, 0);  // delete existing grahp
     cagra_graph     = raft::make_host_matrix<IdxT, int64_t>(curr_graph_size, curr_graph_degree);
-    optimize<IdxT>(
-      res, neighbors.view(), cagra_graph.view(), flag_last ? params.guarantee_connectivity : 0);
+    optimize<IdxT>(res,
+                   neighbors.view(),
+                   cagra_graph.view(),
+                   flag_last ? params.guarantee_connectivity : 0,
+                   deactivated_nodes_bitset);
     if (flag_last) { break; }
   }
 
@@ -608,12 +652,21 @@ index<T, IdxT> build(
     "IVF_PQ and NN_DESCENT for CAGRA graph build do not support BitwiseHamming as a metric. Please "
     "use the iterative CAGRA search build.");
 
+  //
+  uint32_t* bitset_ptr = nullptr;
+  size_t bitset_size   = 0;
+  if (params.deactivate_duplicate_nodes) {
+    bitset_size = sizeof(uint32_t) * (dataset.extent(0) + 31) / 32;
+    bitset_ptr  = (uint32_t*)malloc(bitset_size);
+    memset(bitset_ptr, 0, bitset_size);
+  }
+
   auto cagra_graph = raft::make_host_matrix<IdxT, int64_t>(0, 0);
 
   // Dispatch based on graph_build_params
   if (std::holds_alternative<cagra::graph_build_params::iterative_search_params>(
         knn_build_params)) {
-    cagra_graph = iterative_build_graph<T, IdxT, Accessor>(res, params, dataset);
+    cagra_graph = iterative_build_graph<T, IdxT, Accessor>(res, params, dataset, bitset_ptr);
   } else {
     std::optional<raft::host_matrix<IdxT, int64_t>> knn_graph(
       raft::make_host_matrix<IdxT, int64_t>(dataset.extent(0), intermediate_degree));
@@ -650,6 +703,7 @@ index<T, IdxT> build(
     // free intermediate graph before trying to create the index
     knn_graph.reset();
   }
+  if (bitset_ptr) { free(bitset_ptr); }
 
   RAFT_LOG_INFO("Graph optimized, creating index");
 
