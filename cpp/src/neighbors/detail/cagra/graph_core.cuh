@@ -145,13 +145,16 @@ __global__ void kern_prune(const IdxT* const knn_graph,  // [graph_chunk_size, g
   const uint64_t nid = blockIdx.x + (batch_size * batch_id);
   if (nid >= graph_size) { return; }
   for (uint32_t k = threadIdx.x; k < graph_degree; k += blockDim.x) {
-    smem_num_detour[k] = 0;
+    if (knn_graph[k + (graph_degree * nid)] == nid) {
+      // For self-edge, set the number of detours to the maximum.
+      smem_num_detour[k] = graph_degree;
+    } else {
+      smem_num_detour[k] = 0;
+    }
   }
   __syncthreads();
 
   const uint64_t iA = nid;
-  if (iA >= graph_size) { return; }
-
   // count number of detours (A->D->B)
   for (uint32_t kAD = 0; kAD < graph_degree - 1; kAD++) {
     const uint64_t iD = knn_graph[kAD + (graph_degree * iA)];
@@ -717,8 +720,7 @@ void mst_optimization(raft::resources const& res,
     num_deactivated_nodes =
       cuvs::neighbors::cagra::detail::bitset_count(deactivated_nodes_bitset, graph_size);
   }
-  RAFT_LOG_INFO(
-    "[%s, %d] num_deactivated_nodes: %lu", __FILE__, __LINE__, (uint64_t)num_deactivated_nodes);
+  RAFT_LOG_INFO("num_deactivated_nodes: %lu", (uint64_t)num_deactivated_nodes);
 
   // Initialize arrays
 #pragma omp parallel for
@@ -1085,26 +1087,17 @@ void mst_optimization(raft::resources const& res,
 }
 
 template <typename IdxT = uint32_t>
-bool deactivate_node(IdxT* output_graph,
-                     uint64_t output_degree,
-                     const IdxT* input_graph,
-                     uint64_t input_degree,
-                     IdxT node_id)
+bool isolate_deactivated_node(IdxT* graph_ptr,
+                              uint64_t degree,
+                              IdxT node_id,
+                              const uint32_t* bitset_ptr = nullptr)
 {
-  bool deactivated_node = true;
-  for (uint64_t k = 0; k < input_degree; k++) {
-    if (input_graph[k] != node_id) {
-      deactivated_node = false;
-      break;
-    }
+  if (bitset_ptr == nullptr) return false;
+  if (!cuvs::neighbors::cagra::detail::bitset_test(bitset_ptr, node_id)) { return false; }
+  for (uint64_t k = 0; k < degree; k++) {
+    graph_ptr[k] = node_id;
   }
-  if (deactivated_node) {
-    // RAFT_LOG_INFO("Node %lu is a deactivated node.", (uint64_t)node_id);
-    for (uint64_t k = 0; k < output_degree; k++) {
-      output_graph[k] = node_id;
-    }
-  }
-  return deactivated_node;
+  return true;
 }
 
 template <
@@ -1248,15 +1241,18 @@ void optimize(
 
     // Create pruned kNN graph
     bool invalid_neighbor_list = false;
+    uint64_t invalid_node_id   = graph_size;
 #pragma omp parallel for
     for (uint64_t i = 0; i < graph_size; i++) {
       // If a node is deactivated, isolate it
-      if (deactivate_node<IdxT>(output_graph_ptr + (output_graph_degree * i),
-                                output_graph_degree,
-                                input_graph_ptr + (input_graph_degree * i),
-                                input_graph_degree,
-                                i)) {
+      if (isolate_deactivated_node<IdxT>(output_graph_ptr + (output_graph_degree * i),
+                                         output_graph_degree,
+                                         i,
+                                         deactivated_nodes_bitset)) {
         continue;
+      }
+      for (uint64_t k = 0; k < output_graph_degree; k++) {
+        output_graph_ptr[k + (output_graph_degree * i)] = i;
       }
 
       // Find the `output_graph_degree` smallest detourable count nodes by checking the detourable
@@ -1306,13 +1302,63 @@ void optimize(
           output_graph_degree,
           i);
         invalid_neighbor_list = true;
+        invalid_node_id       = i;
       }
     }
+
+    if (invalid_neighbor_list) {
+      uint64_t i = invalid_node_id;
+      char buffer[256];
+      std::string message = "";
+      std::sprintf(buffer, "Nodes containing invalid edges exist after pruning.\n");
+      message += buffer;
+      std::sprintf(buffer, "Node id: %lu", i);
+      message += buffer;
+      if (deactivated_nodes_bitset) {
+        if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, i)) {
+          message += " (This is a deactivated node)";
+        } else {
+          message += " (This is an active node)";
+        }
+      }
+      message += "\n";
+
+      uint64_t count = 0;
+      std::sprintf(buffer, "Initial graph (degree:%lu):", (uint64_t)input_graph_degree);
+      message += buffer;
+      for (uint64_t k = 0; k < input_graph_degree; k++) {
+        uint64_t j = input_graph_ptr[k + (input_graph_degree * i)];
+        std::sprintf(buffer, " %lu,", j);
+        message += buffer;
+        if (i == j) { count += 1; }
+      }
+      message += "\n";
+      std::sprintf(buffer, "Number of self edges in input graph: %lu\n", count);
+      message += buffer;
+
+      count = 0;
+      std::sprintf(buffer, "Pruned graph (degree:%lu):", (uint64_t)output_graph_degree);
+      message += buffer;
+      for (uint64_t k = 0; k < output_graph_degree; k++) {
+        uint64_t j = output_graph_ptr[k + (output_graph_degree * i)];
+        std::sprintf(buffer, " %lu,", j);
+        message += buffer;
+        if (i == j) { count += 1; }
+      }
+      message += "\n";
+      std::sprintf(buffer, "Number of self edges in output graph: %lu\n", count);
+      message += buffer;
+
+      RAFT_LOG_WARN("%s", message.c_str());
+    }
+
+#if 0
     RAFT_EXPECTS(
       !invalid_neighbor_list,
       "Could not generate an intermediate CAGRA graph because the initial kNN graph contains too "
       "many invalid or duplicated neighbor nodes. This error can occur, for example, if too many "
       "overflows occur during the norm computation between the dataset vectors.");
+#endif
 
     const double time_prune_end = cur_time();
     RAFT_LOG_DEBUG(
@@ -1406,8 +1452,8 @@ void optimize(
       auto my_out_graph = output_graph_ptr + (output_graph_degree * i);
 
       // If a node is deactivated, isolate it
-      if (deactivate_node<IdxT>(
-            my_out_graph, output_graph_degree, my_rev_graph, output_graph_degree, i)) {
+      if (isolate_deactivated_node<IdxT>(
+            my_out_graph, output_graph_degree, i, deactivated_nodes_bitset)) {
         continue;
       }
 
@@ -1542,32 +1588,87 @@ void optimize(
 
   // Check duplication and out-of-range indices
   {
-    uint64_t num_dup = 0;
-    uint64_t num_oor = 0;
+    uint64_t num_dup     = 0;
+    uint64_t num_oor     = 0;
+    uint64_t dup_node_id = graph_size;
+    uint64_t oor_node_id = graph_size;
 #pragma omp parallel for reduction(+ : num_dup) reduction(+ : num_oor)
     for (uint64_t i = 0; i < graph_size; i++) {
+      if (deactivated_nodes_bitset) {
+        if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, i)) { continue; }
+      }
       auto my_out_graph = output_graph_ptr + (output_graph_degree * i);
       for (uint32_t j = 0; j < output_graph_degree; j++) {
         const auto neighbor_a = my_out_graph[j];
 
-        // Check self edge
+        // Check if self edge
         if (neighbor_a == i) { continue; }
 
         // Check oor
-        if (neighbor_a > graph_size) {
+        if (neighbor_a >= graph_size) {
           num_oor++;
+          oor_node_id = i;
           continue;
         }
 
         // Check duplication
         for (uint32_t k = j + 1; k < output_graph_degree; k++) {
           const auto neighbor_b = my_out_graph[k];
-          if (neighbor_a == neighbor_b) { num_dup++; }
+          if (neighbor_a == neighbor_b) {
+            num_dup++;
+            dup_node_id = i;
+          }
         }
       }
     }
+
+    if (num_dup) {
+      uint64_t i = dup_node_id;
+      char buffer[256];
+      std::string message = "";
+      std::sprintf(buffer, "Nodes containing the same edge exist in final graph.\n");
+      message += buffer;
+      std::sprintf(buffer, "Node id: %lu\n", i);
+      message += buffer;
+      uint64_t count = 0;
+      std::sprintf(buffer, "Final graph (degree:%lu):", (uint64_t)output_graph_degree);
+      message += buffer;
+      for (uint64_t k = 0; k < output_graph_degree; k++) {
+        uint64_t j = output_graph_ptr[k + (output_graph_degree * i)];
+        std::sprintf(buffer, " %lu,", j);
+        message += buffer;
+        if (i == j) { count += 1; }
+      }
+      message += "\n";
+      std::sprintf(buffer, "Number of self edges in final graph: %lu\n", count);
+      message += buffer;
+      RAFT_LOG_WARN("%s", message.c_str());
+    }
     RAFT_EXPECTS(
       num_dup == 0, "%lu duplicated node(s) are found in the generated CAGRA graph", num_dup);
+
+    if (num_oor) {
+      uint64_t i = oor_node_id;
+      char buffer[256];
+      std::string message = "";
+      std::sprintf(buffer, "Nodes containing invalid edges exist in final graph.\n");
+      message += buffer;
+      std::sprintf(buffer, "Node id: %lu\n", i);
+      message += buffer;
+      uint64_t count = 0;
+      std::sprintf(buffer, "Final graph (degree:%lu):", (uint64_t)output_graph_degree);
+      message += buffer;
+      for (uint64_t k = 0; k < output_graph_degree; k++) {
+        uint64_t j = output_graph_ptr[k + (output_graph_degree * i)];
+        std::sprintf(buffer, " %lu,", j);
+        message += buffer;
+        if (i == j) { count += 1; }
+      }
+      message += "\n";
+      std::sprintf(buffer, "Number of self edges in final graph: %lu\n", count);
+      message += buffer;
+      RAFT_LOG_WARN("%s", message.c_str());
+    }
     RAFT_EXPECTS(num_oor == 0,
                  "%lu out-of-range index node(s) are found in the generated CAGRA graph",
                  num_oor);

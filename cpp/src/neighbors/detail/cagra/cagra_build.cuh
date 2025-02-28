@@ -406,6 +406,67 @@ template <typename T,
           typename IdxT     = uint32_t,
           typename Accessor = raft::host_device_accessor<std::experimental::default_accessor<T>,
                                                          raft::memory_type::host>>
+bool check_if_same_vector(
+  raft::mdspan<const T, raft::matrix_extent<int64_t>, raft::row_major, Accessor> dataset,
+  const IdxT i,
+  const IdxT j)
+{
+  for (auto k = 0; k < dataset.extent(1); k++) {
+    if (dataset(i, k) != dataset(j, k)) { return false; }
+  }
+  return true;
+}
+
+template <typename T,
+          typename IdxT     = uint32_t,
+          typename Accessor = raft::host_device_accessor<std::experimental::default_accessor<T>,
+                                                         raft::memory_type::host>>
+void deactivate_duplicate_nodes(
+  raft::host_matrix_view<IdxT, int64_t, raft::row_major> graph,
+  raft::mdspan<const T, raft::matrix_extent<int64_t>, raft::row_major, Accessor> dataset,
+  uint32_t* bitset_ptr = nullptr)
+{
+  if (bitset_ptr == nullptr) return;
+
+  // If there are nodes with the same vector, the one with the large ID
+  // is deactivated as a duplicate node.
+  RAFT_LOG_INFO("Deactivating duplicate nodes (# nodes: %lu)", (uint64_t)graph.extent(0));
+  uint64_t count = 0;
+  for (IdxT i = 0; i < graph.extent(0); i++) {
+    if (cuvs::neighbors::cagra::detail::bitset_test(bitset_ptr, i)) {
+      count += 1;
+      continue;
+    }
+    auto j = graph(i, 0);
+    if (i <= j) continue;
+    if (!check_if_same_vector(dataset, i, j)) continue;
+    // RAFT_LOG_INFO("# Node %lu and %lu have the same vector.", (uint64_t)i, (uint64_t)j);
+    cuvs::neighbors::cagra::detail::bitset_set(bitset_ptr, i, true);
+    count += 1;
+  }
+  if (count > 0) { RAFT_LOG_INFO("Duplicate nodes were found (# deactivated nodes: %lu)", count); }
+
+#pragma omp parallel for
+  for (IdxT i = 0; i < graph.extent(0); i++) {
+    if (cuvs::neighbors::cagra::detail::bitset_test(bitset_ptr, i)) {
+      // If node-i is a duplicate node, all edges from it are directed back to itself.
+      for (int64_t k = 0; k < graph.extent(1); k++) {
+        graph(i, k) = i;
+      }
+    } else {
+      for (int64_t k = 0; k < graph.extent(1); k++) {
+        auto j = graph(i, k);
+        // If node-j is a duplicate node, an edge to it is directed back to node-i.
+        if (cuvs::neighbors::cagra::detail::bitset_test(bitset_ptr, j)) { graph(i, k) = i; }
+      }
+    }
+  }
+}
+
+template <typename T,
+          typename IdxT     = uint32_t,
+          typename Accessor = raft::host_device_accessor<std::experimental::default_accessor<T>,
+                                                         raft::memory_type::host>>
 auto iterative_build_graph(
   raft::resources const& res,
   const index_params& params,
@@ -518,7 +579,6 @@ auto iterative_build_graph(
     auto dev_query_view = raft::make_device_matrix_view<const T, int64_t>(
       dev_dataset.data_handle(), (int64_t)curr_query_size, dev_dataset.extent(1));
     auto neighbors = raft::make_host_matrix<IdxT, int64_t>(curr_query_size, curr_topk);
-    auto distances = raft::make_host_matrix<float, int64_t>(curr_query_size, curr_topk);
 
     // Search.
     // Since there are many queries, divide them into batches and search them.
@@ -550,45 +610,10 @@ auto iterative_build_graph(
                  batch_dev_neighbors_view.data_handle(),
                  batch_neighbors_view.size(),
                  raft::resource::get_cuda_stream(res));
-      auto batch_distances_view = raft::make_host_matrix_view<float, int64_t>(
-        distances.data_handle() + batch.offset() * curr_topk, batch.size(), curr_topk);
-      raft::copy(batch_distances_view.data_handle(),
-                 batch_dev_distances_view.data_handle(),
-                 batch_distances_view.size(),
-                 raft::resource::get_cuda_stream(res));
     }
 
     // Deactivate duplicate nodes
-    if (deactivated_nodes_bitset) {
-      RAFT_LOG_INFO("Disabling duplicate nodes");
-      for (IdxT i = 0; i < curr_query_size; i++) {
-        if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, i)) continue;
-        if (distances(i, 0) > 0) continue;
-        auto j = neighbors(i, 0);
-        if (i <= j) continue;
-
-        RAFT_LOG_INFO("# node %lu and %lu may be duplicated nodes.", (uint64_t)i, (uint64_t)j);
-        cuvs::neighbors::cagra::detail::bitset_set(deactivated_nodes_bitset, i, true);
-      }
-      for (IdxT i = 0; i < curr_query_size; i++) {
-        if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, i)) {
-          // If node-i is a duplicate node, all edges from it are directed back to itself.
-          for (uint64_t k = 0; k < curr_topk; k++) {
-            neighbors(i, k) = i;
-          }
-        } else {
-          for (uint64_t k = 0; k < curr_topk; k++) {
-            auto j = neighbors(i, k);
-            // If node-j is a duplicate node, an edge to it is directed back to node-i.
-            if (cuvs::neighbors::cagra::detail::bitset_test(deactivated_nodes_bitset, j)) {
-              neighbors(i, k) = i;
-            }
-          }
-        }
-      }
-    }
-
-    RAFT_LOG_INFO("params.guarantee_connectivity = %d", (int)params.guarantee_connectivity);
+    deactivate_duplicate_nodes(neighbors.view(), dataset, deactivated_nodes_bitset);
 
     // Optimize graph
     bool flag_last  = (curr_graph_size == final_graph_size);
@@ -695,10 +720,14 @@ index<T, IdxT> build(
       build_knn_graph<T, IdxT>(res, dataset, knn_graph->view(), nn_descent_params);
     }
 
+    // Deactivate duplicate nodes
+    deactivate_duplicate_nodes(knn_graph->view(), dataset, bitset_ptr);
+
     cagra_graph = raft::make_host_matrix<IdxT, int64_t>(dataset.extent(0), graph_degree);
 
     RAFT_LOG_INFO("optimizing graph");
-    optimize<IdxT>(res, knn_graph->view(), cagra_graph.view(), params.guarantee_connectivity);
+    optimize<IdxT>(
+      res, knn_graph->view(), cagra_graph.view(), params.guarantee_connectivity, bitset_ptr);
 
     // free intermediate graph before trying to create the index
     knn_graph.reset();
